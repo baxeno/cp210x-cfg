@@ -39,6 +39,7 @@
 #include <libusb-1.0/libusb.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -47,8 +48,9 @@
 
 #define CP210X_CFG 0xff
 #define TIMEOUT_MS 500
+// Max descriptor lengths (bLength), including the 2 byte header
 #define MAX_SERIAL 128
-#define MAX_NAME   256
+#define MAX_NAME   255
 #define MAX_MANUF  128
 
 
@@ -398,24 +400,30 @@ static bool cp210x_set_mode (libusb_device_handle *cp210x, uint16_t mode)
   return cp210x_set_cfg (cp210x, ITEM_MODE, 0, (uint8_t *)&mode, 2);
 }
 
-static bool encode_descriptor_string (uint8_t out[256], const char *str)
+// Encodes str as a USB string descriptor of at most maxlen bytes (bLength).
+// Nothing is written to out unless the whole string fits.
+static bool encode_descriptor_string (uint8_t out[256], unsigned maxlen, const char *what, const char *str)
 {
-  int len = strlen (str);
-  if (len > 126)
+  size_t len = strlen (str);
+  if (len * 2 + 2 > maxlen)
   {
-    fprintf (stderr, "error: descriptor string is too long\n");
+    fprintf (stderr, "error: %s string is too long (max %u characters)\n",
+      what, (maxlen - 2) / 2);
     return false;
   }
-  out[0] = len * 2 + 2;
-  out[1] = 0x03;
-  // poor-man's utf-16-le encoding
-  for (int i = 0, o = 2; i < len; ++i, o += 2)
+  for (size_t i = 0; i < len; ++i)
   {
     if (str[i] & 0x80)
     {
       fprintf (stderr, "error: only ASCII descriptor strings supported\n");
       return false;
     }
+  }
+  out[0] = len * 2 + 2;
+  out[1] = 0x03;
+  // poor-man's utf-16-le encoding
+  for (size_t i = 0, o = 2; i < len; ++i, o += 2)
+  {
     out[o] = str[i];
     out[o+1] = 0;
   }
@@ -425,7 +433,7 @@ static bool encode_descriptor_string (uint8_t out[256], const char *str)
 static bool cp210x_set_name (libusb_device_handle *cp210x, const char *name)
 {
   uint8_t buffer[256];
-  if (!encode_descriptor_string (buffer, name))
+  if (!encode_descriptor_string (buffer, MAX_NAME, "name", name))
     return false;
   return cp210x_set_cfg (cp210x, ITEM_NAME, 0, buffer, buffer[0]);
 }
@@ -433,54 +441,39 @@ static bool cp210x_set_name (libusb_device_handle *cp210x, const char *name)
 static bool cp210x_set_serial (libusb_device_handle *cp210x, const char *serial)
 {
   uint8_t buffer[256];
-  if (!encode_descriptor_string (buffer, serial))
+  if (!encode_descriptor_string (buffer, MAX_SERIAL, "serial", serial))
     return false;
-  if (buffer[0] > MAX_SERIAL)
-  {
-    fprintf (stderr, "error: serial string too long\n");
-    return false;
-  }
   return cp210x_set_cfg (cp210x, ITEM_SERI, 0, buffer, buffer[0]);
 }
 
-static bool cp2102n_set_name(struct cp2102n_config* cfg, const char *serial)
+// Replaces a string descriptor of desclen bytes in the config block
+static bool cp2102n_set_string (uint8_t *desc, size_t desclen, unsigned maxlen, const char *what, const char *str)
 {
-  memset(cfg->prodDesc.set_ids_productString, 0, sizeof(cfg->prodDesc.set_ids_productString));
-
-  if (!encode_descriptor_string ((uint8_t*) &cfg->prodDesc, serial))
+  uint8_t buffer[256];
+  if (!encode_descriptor_string (buffer, maxlen, what, str))
     return false;
-
+  memset (desc, 0, desclen);
+  memcpy (desc, buffer, buffer[0]);
   return true;
 }
 
-static bool cp2102n_set_serial(struct cp2102n_config* cfg, const char *name)
+static bool cp2102n_set_name (struct cp2102n_config *cfg, const char *name)
 {
-  memset(cfg->serDesc.set_ids_serialString, 0, sizeof(cfg->serDesc.set_ids_serialString));
-
-  if (!encode_descriptor_string ((uint8_t*) &cfg->serDesc, name))
-    return false;
-  if (cfg->serDesc.serDescLen > MAX_SERIAL)
-  {
-    fprintf (stderr, "error: serial string too long\n");
-    return false;
-  }
-
-  return true;
+  return cp2102n_set_string ((uint8_t *)&cfg->prodDesc,
+    sizeof (cfg->prodDesc), MAX_NAME, "name", name);
 }
 
-static bool cp2102n_set_manuf(struct cp2102n_config* cfg, const char *name)
+static bool cp2102n_set_serial (struct cp2102n_config *cfg, const char *serial)
 {
-  memset(cfg->mfrDesc.set_ids_manufacturerString, 0, sizeof(cfg->mfrDesc.set_ids_manufacturerString));
+  return cp2102n_set_string ((uint8_t *)&cfg->serDesc,
+    sizeof (cfg->serDesc), MAX_SERIAL, "serial", serial);
+}
 
-  if (!encode_descriptor_string ((uint8_t*) &cfg->mfrDesc, name))
-    return false;
-  if (cfg->mfrDesc.mfrDescLen > MAX_MANUF)
-  {
-    fprintf (stderr, "error: manufacturer string too long\n");
-    return false;
-  }
-
-  return true;
+static bool cp2102n_set_manuf (struct cp2102n_config *cfg, const char *manuf)
+{
+  return cp2102n_set_string ((uint8_t *)&cfg->mfrDesc,
+    offsetof (struct cp2102n_mfrDesc, bitpadding), MAX_MANUF,
+    "manufacturer", manuf);
 }
 
 static bool cp210x_reset (libusb_device_handle *cp210x)
@@ -702,48 +695,36 @@ int main (int argc, char *argv[])
     usb_err_out("failed to read model", ret, 6);
 
   if (model >= 32) {
-    bool changed = false;
-
     ret = cp2102n_read_config(cp210x, &cp2102n_cfg);
     if (ret < 0)
       usb_err_out("failed to read config", ret, 7);
 
-    if (set_vid) {
+    // All changes go into a single config block, so none of them are
+    // written unless all of them are valid
+    bool valid = true;
+    if (set_vid)
       put_le16 (&cp2102n_cfg.deviceDesc.set_ids_VID, new_vid);
-      changed = true;
-    }
-
-    if (set_pid) {
+    if (set_pid)
       put_le16 (&cp2102n_cfg.deviceDesc.set_ids_PID, new_pid);
-      changed = true;
-    }
-
-    if (set_serial) {
-     cp2102n_set_serial(&cp2102n_cfg, new_serial);
-     changed = true;
-    }
-
-    if (set_serial) {
-     cp2102n_set_serial(&cp2102n_cfg, new_serial);
-     changed = true;
-    }
-
-    if (set_serial_int) {
+    if (set_name)
+      valid &= cp2102n_set_name (&cp2102n_cfg, new_name);
+    if (set_serial)
+      valid &= cp2102n_set_serial (&cp2102n_cfg, new_serial);
+    if (set_serial)
+      valid &= cp2102n_set_serial (&cp2102n_cfg, new_serial);
+    if (set_manuf)
+      valid &= cp2102n_set_manuf (&cp2102n_cfg, new_manuf);
+    if (set_serial_int)
       cp2102n_cfg.useInternalSerial = new_serial_int ? 255 : 0;
-      changed = true;
+
+    if (!valid)
+    {
+      fprintf (stderr, "error: config not written\n");
+      exitcode = 14;
+      goto out;
     }
 
-    if (set_name) {
-      cp2102n_set_name(&cp2102n_cfg, new_name);
-      changed = true;
-    }
-
-    if (set_manuf) {
-      cp2102n_set_manuf(&cp2102n_cfg, new_manuf);
-      changed = true;
-    }
-
-    if (changed) {
+    if (set_vid || set_pid || set_name || set_serial || set_manuf || set_serial_int) {
       uint16_t cs = fletcher16((uint8_t*) &cp2102n_cfg, sizeof(struct cp2102n_config) - CP2102N_CHECKSUM_LEN);
 
       // checksum must be in big endian
