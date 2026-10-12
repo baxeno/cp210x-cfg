@@ -269,6 +269,14 @@ static int read_str (libusb_device_handle *cp210x, uint16_t item, uint8_t *buffe
 }
 
 
+// USB descriptor fields are little endian, regardless of host byte order
+static void put_le16 (void *field, uint16_t value)
+{
+  uint8_t *p = field;
+  p[0] = value;
+  p[1] = value >> 8;
+}
+
 static int cp2102n_read_config(libusb_device_handle *cp210x, struct cp2102n_config* cfg)
 {
   memset(cfg, 0, sizeof(struct cp2102n_config));
@@ -699,6 +707,16 @@ int main (int argc, char *argv[])
     ret = cp2102n_read_config(cp210x, &cp2102n_cfg);
     if (ret < 0)
       usb_err_out("failed to read config", ret, 7);
+
+    if (set_vid) {
+      put_le16 (&cp2102n_cfg.deviceDesc.set_ids_VID, new_vid);
+      changed = true;
+    }
+
+    if (set_pid) {
+      put_le16 (&cp2102n_cfg.deviceDesc.set_ids_PID, new_pid);
+      changed = true;
+    }
 
     if (set_serial) {
      cp2102n_set_serial(&cp2102n_cfg, new_serial);
