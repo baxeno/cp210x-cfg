@@ -66,6 +66,9 @@
 #define ITEM_FLUSH 0x370d
 #define ITEM_MODE  0x3711
 
+#define CP2102N_READ_CONFIG  0x000e
+#define CP2102N_WRITE_CONFIG 0x370f
+
 /* Config structore for 2102n devices is from
    https://www.silabs.com/documents/public/application-notes/AN978-cp210x-usb-to-uart-api-specification.pdf 
 */
@@ -193,9 +196,10 @@ struct cp2102n_config {
     uint16_t fletcherChecksum;
 } __attribute__((packed));
 
-#define CP2102N_CHECKSUM_LEN 2
+_Static_assert (sizeof (struct cp2102n_config) == 0x2a6,
+  "CP2102N config block must be 0x2a6 bytes");
 
-static struct cp2102n_config cp2102n_cfg;
+#define CP2102N_CHECKSUM_LEN 2
 
 typedef struct
 {
@@ -279,18 +283,74 @@ static void put_le16 (void *field, uint16_t value)
   p[1] = value >> 8;
 }
 
-static int cp2102n_read_config(libusb_device_handle *cp210x, struct cp2102n_config* cfg)
+static uint16_t fletcher16(const uint8_t *dataIn, uint16_t bytes)
 {
-  memset(cfg, 0, sizeof(struct cp2102n_config));
+  uint16_t sum1 = 0xff, sum2 = 0xff;
+  uint16_t tlen;
+  while (bytes) {
+    tlen = bytes >= 20 ? 20 : bytes;
+    bytes -= tlen;
 
-  return libusb_control_transfer(cp210x, 0xC0, 0xFF, 0xe, 0,
-          (uint8_t*) cfg, sizeof(struct cp2102n_config), 0);
+    do {
+      sum2 += sum1 += *dataIn++;
+    } while (--tlen);
+    sum1 = (sum1 & 0xff) + (sum1 >> 8);
+    sum2 = (sum2 & 0xff) + (sum2 >> 8);
+  }
+  /* Second reduction step to reduce sums to 8 bits */
+  sum1 = (sum1 & 0xff) + (sum1 >> 8);
+  sum2 = (sum2 & 0xff) + (sum2 >> 8);
+  return sum2 << 8 | sum1;
 }
 
-static int cp2102n_write_config(libusb_device_handle *cp210x, struct cp2102n_config* cfg)
+static uint16_t cp2102n_checksum (const struct cp2102n_config *cfg)
 {
-  return libusb_control_transfer(cp210x, 0x40, 0xFF, 0x370F, 0,
-          (uint8_t*) cfg, sizeof(struct cp2102n_config), 0);
+  return fletcher16 ((const uint8_t *)cfg, sizeof (*cfg) - CP2102N_CHECKSUM_LEN);
+}
+
+// Reads the whole config block, and rejects it unless it is complete and
+// its checksum is valid, so a bad read can never be written back.
+static int cp2102n_read_config (libusb_device_handle *cp210x, struct cp2102n_config *cfg)
+{
+  memset (cfg, 0, sizeof (*cfg));
+
+  int ret = libusb_control_transfer (cp210x,
+    LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+    CP210X_CFG, CP2102N_READ_CONFIG, 0,
+    (uint8_t *)cfg, sizeof (*cfg), 0);
+  if (ret < 0)
+    return ret;
+  if ((unsigned)ret != sizeof (*cfg))
+  {
+    fprintf (stderr, "error: short config read, got %d of %zu bytes\n",
+      ret, sizeof (*cfg));
+    return LIBUSB_ERROR_IO;
+  }
+  // checksum is stored big endian
+  if (ntohs (cfg->fletcherChecksum) != cp2102n_checksum (cfg))
+  {
+    fprintf (stderr, "error: config checksum mismatch\n");
+    return LIBUSB_ERROR_IO;
+  }
+  return ret;
+}
+
+static int cp2102n_write_config (libusb_device_handle *cp210x, struct cp2102n_config *cfg)
+{
+  // checksum must be in big endian
+  cfg->fletcherChecksum = htons (cp2102n_checksum (cfg));
+
+  int ret = libusb_control_transfer (cp210x,
+    LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+    CP210X_CFG, CP2102N_WRITE_CONFIG, 0,
+    (uint8_t *)cfg, sizeof (*cfg), 0);
+  if (ret >= 0 && (unsigned)ret != sizeof (*cfg))
+  {
+    fprintf (stderr, "error: short config write, sent %d of %zu bytes\n",
+      ret, sizeof (*cfg));
+    return LIBUSB_ERROR_IO;
+  }
+  return ret;
 }
 
 static const config_param_t cfg_items[] =
@@ -360,12 +420,17 @@ static void print_cp210x_cfg (libusb_device_handle *cp210x)
      }
   }
 
-  if (model >= 32) {
-    if (cp2102n_read_config(cp210x, &cp2102n_cfg) < 0)
+  if (model >= 32)
+  {
+    struct cp2102n_config cfg;
+    int ret = cp2102n_read_config (cp210x, &cfg);
+    if (ret < 0)
+    {
+      fprintf (stderr, "error: failed to read config: %s\n",
+        libusb_strerror (ret));
       return;
-    
-    printf("Use internal serial: %d\n", cp2102n_cfg.useInternalSerial ? 1 : 0);
-    //printf("Serial (user): %s\n", )
+    }
+    printf ("Use internal serial: %d\n", cfg.useInternalSerial ? 1 : 0);
   }
 }
 
@@ -490,26 +555,6 @@ static bool recognised_cp210x_dev (uint16_t vid, uint16_t pid)
       return true;
   }
   return false;
-}
-
-static uint16_t fletcher16(uint8_t *dataIn, uint16_t bytes)
-{
-  uint16_t sum1 = 0xff, sum2 = 0xff;
-  uint16_t tlen;
-  while (bytes) {
-    tlen = bytes >= 20 ? 20 : bytes;
-    bytes -= tlen;
-
-    do {
-      sum2 += sum1 += *dataIn++;
-    } while (--tlen);
-    sum1 = (sum1 & 0xff) + (sum1 >> 8);
-    sum2 = (sum2 & 0xff) + (sum2 >> 8);
-  }
-  /* Second reduction step to reduce sums to 8 bits */
-  sum1 = (sum1 & 0xff) + (sum1 >> 8);
-  sum2 = (sum2 & 0xff) + (sum2 >> 8);
-  return sum2 << 8 | sum1;
 }
 
 void syntax (void)
@@ -695,7 +740,9 @@ int main (int argc, char *argv[])
     usb_err_out("failed to read model", ret, 6);
 
   if (model >= 32) {
-    ret = cp2102n_read_config(cp210x, &cp2102n_cfg);
+    struct cp2102n_config cfg;
+
+    ret = cp2102n_read_config(cp210x, &cfg);
     if (ret < 0)
       usb_err_out("failed to read config", ret, 7);
 
@@ -703,19 +750,19 @@ int main (int argc, char *argv[])
     // written unless all of them are valid
     bool valid = true;
     if (set_vid)
-      put_le16 (&cp2102n_cfg.deviceDesc.set_ids_VID, new_vid);
+      put_le16 (&cfg.deviceDesc.set_ids_VID, new_vid);
     if (set_pid)
-      put_le16 (&cp2102n_cfg.deviceDesc.set_ids_PID, new_pid);
+      put_le16 (&cfg.deviceDesc.set_ids_PID, new_pid);
     if (set_name)
-      valid &= cp2102n_set_name (&cp2102n_cfg, new_name);
+      valid &= cp2102n_set_name (&cfg, new_name);
     if (set_serial)
-      valid &= cp2102n_set_serial (&cp2102n_cfg, new_serial);
+      valid &= cp2102n_set_serial (&cfg, new_serial);
     if (set_serial)
-      valid &= cp2102n_set_serial (&cp2102n_cfg, new_serial);
+      valid &= cp2102n_set_serial (&cfg, new_serial);
     if (set_manuf)
-      valid &= cp2102n_set_manuf (&cp2102n_cfg, new_manuf);
+      valid &= cp2102n_set_manuf (&cfg, new_manuf);
     if (set_serial_int)
-      cp2102n_cfg.useInternalSerial = new_serial_int ? 255 : 0;
+      cfg.useInternalSerial = new_serial_int ? 255 : 0;
 
     if (!valid)
     {
@@ -725,12 +772,7 @@ int main (int argc, char *argv[])
     }
 
     if (set_vid || set_pid || set_name || set_serial || set_manuf || set_serial_int) {
-      uint16_t cs = fletcher16((uint8_t*) &cp2102n_cfg, sizeof(struct cp2102n_config) - CP2102N_CHECKSUM_LEN);
-
-      // checksum must be in big endian
-      cp2102n_cfg.fletcherChecksum = htons(cs);
-
-      ret = cp2102n_write_config(cp210x, &cp2102n_cfg);
+      ret = cp2102n_write_config(cp210x, &cfg);
       printf("ret: %d\n", ret);
       if (ret < 0)
         usb_err_out("failed to write config", ret, 8);
