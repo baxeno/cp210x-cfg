@@ -276,6 +276,12 @@ static int read_str (libusb_device_handle *cp210x, uint16_t item, uint8_t *buffe
 
 
 // USB descriptor fields are little endian, regardless of host byte order
+static uint16_t get_le16 (const void *field)
+{
+  const uint8_t *p = field;
+  return p[0] | (p[1] << 8);
+}
+
 static void put_le16 (void *field, uint16_t value)
 {
   uint8_t *p = field;
@@ -370,6 +376,29 @@ static const config_param_t cfg_items[] =
   { ITEM_MODE,  0, 2, CFG_INT16, MODEL(5), read_vendor, "SCI/ECI mode: %04hx\n" },
 };
 
+// Prints a UTF-16LE string descriptor from the config block as ASCII
+static void print_descriptor_string (const char *fmtstr, const uint8_t *desc, size_t desclen)
+{
+  char str[128] = { 0, };
+  size_t len = desc[0] < desclen ? desc[0] : desclen;
+  for (size_t i = 2, o = 0; i + 1 < len && o < sizeof (str) - 1; i += 2)
+    str[o++] = desc[i+1] ? '?' : (char)desc[i];
+  printf (fmtstr, str);
+}
+
+static void print_cp2102n_cfg (const struct cp2102n_config *cfg)
+{
+  printf ("Vendor ID: %04hx\n", get_le16 (&cfg->deviceDesc.set_ids_VID));
+  printf ("Product ID: %04hx\n", get_le16 (&cfg->deviceDesc.set_ids_PID));
+  print_descriptor_string ("Name: %s\n",
+    (const uint8_t *)&cfg->prodDesc, sizeof (cfg->prodDesc));
+  print_descriptor_string ("Manufacturer: %s\n",
+    (const uint8_t *)&cfg->mfrDesc, offsetof (struct cp2102n_mfrDesc, bitpadding));
+  print_descriptor_string ("Serial (user): %s\n",
+    (const uint8_t *)&cfg->serDesc, sizeof (cfg->serDesc));
+  printf ("Use internal serial: %d\n", cfg->useInternalSerial ? 1 : 0);
+}
+
 static void print_cp210x_cfg (libusb_device_handle *cp210x)
 {
   uint8_t model = 0;
@@ -430,6 +459,8 @@ static void print_cp210x_cfg (libusb_device_handle *cp210x)
         libusb_strerror (ret));
       return;
     }
+    print_descriptor_string ("Serial (user): %s\n",
+      (const uint8_t *)&cfg.serDesc, sizeof (cfg.serDesc));
     printf ("Use internal serial: %d\n", cfg.useInternalSerial ? 1 : 0);
   }
 }
@@ -773,12 +804,23 @@ int main (int argc, char *argv[])
 
     if (set_vid || set_pid || set_name || set_serial || set_manuf || set_serial_int) {
       ret = cp2102n_write_config(cp210x, &cfg);
-      printf("ret: %d\n", ret);
       if (ret < 0)
         usb_err_out("failed to write config", ret, 8);
-      
-    }
 
+      struct cp2102n_config written;
+      ret = cp2102n_read_config (cp210x, &written);
+      if (ret < 0)
+        usb_err_out ("failed to read back config", ret, 9);
+      if (memcmp (&written, &cfg, sizeof (cfg)) != 0)
+      {
+        fprintf (stderr, "error: config read back differs from what was written\n");
+        exitcode = 9;
+        goto out;
+      }
+
+      printf ("New config written and verified:\n");
+      print_cp2102n_cfg (&written);
+    }
   }
   else {
     if (set_vid)
